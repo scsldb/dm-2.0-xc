@@ -1,0 +1,245 @@
+// Copyright 2019 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package syncer
+
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+
+	"github.com/go-sql-driver/mysql"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser"
+	"github.com/pingcap/parser/ast"
+	tmysql "github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb-tools/pkg/dbutil"
+	tddl "github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/infoschema"
+	gmysql "github.com/siddontang/go-mysql/mysql"
+	"go.uber.org/zap"
+
+	tcontext "github.com/pingcap/dm/pkg/context"
+	"github.com/pingcap/dm/pkg/log"
+)
+
+func ignoreDDLError(err error) bool {
+	err = originError(err)
+	mysqlErr, ok := err.(*mysql.MySQLError)
+	if !ok {
+		return false
+	}
+
+	errCode := terror.ErrCode(mysqlErr.Number)
+	switch errCode {
+	case infoschema.ErrDatabaseExists.Code(), infoschema.ErrDatabaseNotExists.Code(), infoschema.ErrDatabaseDropExists.Code(),
+		infoschema.ErrTableExists.Code(), infoschema.ErrTableNotExists.Code(), infoschema.ErrTableDropExists.Code(),
+		infoschema.ErrColumnExists.Code(), infoschema.ErrColumnNotExists.Code(),
+		infoschema.ErrIndexExists.Code(), tddl.ErrCantDropFieldOrKey.Code():
+		return true
+	case tmysql.ErrDupKeyName:
+		return true
+	default:
+		return false
+	}
+}
+
+func needRetryReplicate(err error) bool {
+	err = originError(err)
+	return err == gmysql.ErrBadConn
+}
+
+func isBinlogPurgedError(err error) bool {
+	return isMysqlError(err, tmysql.ErrMasterFatalErrorReadingBinlog)
+}
+
+func isMysqlError(err error, code uint16) bool {
+	err = originError(err)
+	mysqlErr, ok := err.(*mysql.MySQLError)
+	return ok && mysqlErr.Number == code
+}
+
+func isDropColumnWithIndexError(err error) bool {
+	mysqlErr, ok := originError(err).(*mysql.MySQLError)
+	if !ok {
+		return false
+	}
+	// different version of TiDB has different error message, try to cover most versions
+	return mysqlErr.Number == errno.ErrUnsupportedDDLOperation &&
+		strings.Contains(mysqlErr.Message, "drop column") &&
+		strings.Contains(mysqlErr.Message, "with index")
+}
+
+// originError return original error
+func originError(err error) error {
+	for {
+		e := errors.Cause(err)
+		if e == err {
+			break
+		}
+		err = e
+	}
+	return err
+}
+
+// handleSpecialDDLError handles special errors for DDL execution.
+func (s *Syncer) handleSpecialDDLError(tctx *tcontext.Context, err error, ddls []string, index int, conn *DBConn) error {
+	// We use default parser because ddls are came from *Syncer.handleDDL, which is StringSingleQuotes, KeyWordUppercase and NameBackQuotes
+	parser2 := parser.New()
+
+	// it only ignore `invalid connection` error (timeout or other causes) for `ADD INDEX`.
+	// `invalid connection` means some data already sent to the server,
+	// and we assume that the whole SQL statement has already sent to the server for this error.
+	// if we have other methods to judge the DDL dispatched but timeout for executing, we can update this method.
+	// NOTE: we must ensure other PK/UK exists for correctness.
+	// NOTE: when we are refactoring the shard DDL algorithm, we also need to consider supporting non-blocking `ADD INDEX`.
+	invalidConnF := func(tctx *tcontext.Context, err error, ddls []string, index int, conn *DBConn) error {
+		// must ensure only the last statement executed failed with the `invalid connection` error
+		if len(ddls) == 0 || index != len(ddls)-1 || errors.Cause(err) != mysql.ErrInvalidConn {
+			return err // return the original error
+		}
+
+		ddl2 := ddls[index]
+		stmt, err2 := parser2.ParseOneStmt(ddl2, "", "")
+		if err2 != nil {
+			return err // return the original error
+		}
+
+		handle := func() {
+			tctx.L().Warn("ignore special error for DDL", zap.String("DDL", ddl2), log.ShortError(err))
+			err2 := conn.resetConn(tctx) // also reset the `invalid connection` for later use.
+			if err2 != nil {
+				tctx.L().Warn("reset connection failed", log.ShortError(err2))
+			}
+		}
+
+		switch v := stmt.(type) {
+		case *ast.AlterTableStmt:
+			// ddls should be split with only one spec
+			if len(v.Specs) > 1 {
+				return err
+			} else if v.Specs[0].Tp == ast.AlterTableAddConstraint {
+				// only take effect on `ADD INDEX`, no UNIQUE KEY and FOREIGN KEY
+				// UNIQUE KEY may affect correctness, FOREIGN KEY should be filtered.
+				// ref https://github.com/pingcap/tidb/blob/3cdea0dfdf28197ee65545debce8c99e6d2945e3/ddl/ddl_api.go#L1929-L1948.
+				switch v.Specs[0].Constraint.Tp {
+				case ast.ConstraintKey, ast.ConstraintIndex:
+					handle()
+					return nil // ignore the error
+				}
+			}
+		case *ast.CreateIndexStmt:
+			handle()
+			return nil // ignore the error
+		}
+		return err
+	}
+
+	// for DROP COLUMN with its single-column index, try drop index first then drop column
+	dropColumnF := func(tctx *tcontext.Context, originErr error, ddls []string, index int, conn *DBConn) error {
+		if !isDropColumnWithIndexError(originErr) {
+			return originErr
+		}
+		ddl2 := ddls[index]
+		stmt, err2 := parser2.ParseOneStmt(ddl2, "", "")
+		if err2 != nil {
+			return originErr // return the original error
+		}
+
+		var (
+			schema string
+			table  string
+			col    string
+		)
+		if n, ok := stmt.(*ast.AlterTableStmt); !ok {
+			return originErr
+			// support ALTER TABLE tbl_name DROP
+		} else if len(n.Specs) != 1 {
+			return originErr
+		} else if n.Specs[0].Tp != ast.AlterTableDropColumn {
+			return originErr
+		} else {
+			schema = n.Table.Schema.O
+			table = n.Table.Name.O
+			col = n.Specs[0].OldColumnName.Name.O
+		}
+		tctx.L().Warn("try to fix drop column error", zap.String("DDL", ddl2), log.ShortError(originErr))
+
+		// check if dependent index is single-column index on this column
+		sql2 := "SELECT INDEX_NAME FROM information_schema.statistics WHERE TABLE_SCHEMA = ? and TABLE_NAME = ? and COLUMN_NAME = ?"
+		var rows *sql.Rows
+		rows, err2 = conn.querySQL(tctx, sql2, schema, table, col)
+		if err2 != nil {
+			return originErr
+		}
+		var (
+			idx       string
+			idx2Check []string
+			idx2Drop  []string
+			count     int
+		)
+		for rows.Next() {
+			if err2 = rows.Scan(&idx); err2 != nil {
+				rows.Close()
+				return originErr
+			}
+			idx2Check = append(idx2Check, idx)
+		}
+		// Close is idempotent, we could close in advance to reuse conn
+		rows.Close()
+
+		sql2 = "SELECT count(*) FROM information_schema.statistics WHERE TABLE_SCHEMA = ? and TABLE_NAME = ? and INDEX_NAME = ?"
+		for _, idx := range idx2Check {
+			rows, err2 = conn.querySQL(tctx, sql2, schema, table, idx)
+			if err2 != nil || !rows.Next() || rows.Scan(&count) != nil || count != 1 {
+				tctx.L().Warn("can't auto drop index", zap.String("index", idx))
+				rows.Close()
+				return originErr
+			}
+			idx2Drop = append(idx2Drop, idx)
+			rows.Close()
+		}
+
+		sqls := make([]string, len(idx2Drop))
+		for i, idx := range idx2Drop {
+			sqls[i] = fmt.Sprintf("ALTER TABLE %s DROP INDEX %s", dbutil.TableName(schema, table), dbutil.ColumnName(idx))
+		}
+		if _, err2 = conn.executeSQL(tctx, sqls); err2 != nil {
+			tctx.L().Warn("auto drop index failed", log.ShortError(err2))
+			return originErr
+		}
+
+		tctx.L().Info("drop index success, now try to drop column", zap.Strings("index", idx2Drop))
+		if _, err2 = conn.executeSQLWithIgnore(tctx, ignoreDDLError, ddls[index:]); err2 != nil {
+			return err2
+		}
+
+		tctx.L().Info("execute drop column SQL success", zap.String("DDL", ddl2))
+		return nil
+	}
+
+	retErr := err
+	toHandle := []func(*tcontext.Context, error, []string, int, *DBConn) error{
+		dropColumnF,
+		invalidConnF,
+	}
+	for _, f := range toHandle {
+		retErr = f(tctx, retErr, ddls, index, conn)
+		if retErr == nil {
+			break
+		}
+	}
+	return retErr
+}
